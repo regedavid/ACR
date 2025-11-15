@@ -1,0 +1,20 @@
+name: acr
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - scikit-learn
+  - numba
+  - joblib
+  - pip
+  - pip:
+      - mirdata
+      - mir-eval
+      - librosa
+      - soundfile
+      - tqdm
+      - notebook
