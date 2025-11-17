@@ -1,5 +1,7 @@
 name: acr
 channels:
+  - pytorch
+  - nvidia
   - conda-forge
   - defaults
 
@@ -11,6 +13,9 @@ dependencies:
   - numba
   - joblib
   - pip
+
+  - pytorch
+  - pytorch-cuda=12.1
   - pip:
       - mirdata
       - mir-eval
@@ -18,3 +23,4 @@ dependencies:
       - soundfile
       - tqdm
       - notebook
+      - pytorch-lightning
