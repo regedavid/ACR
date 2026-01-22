@@ -16,6 +16,7 @@ dependencies:
 
   - pytorch
   - pytorch-cuda=12.1
+  - torchaudio
   - pip:
       - mirdata
       - mir-eval

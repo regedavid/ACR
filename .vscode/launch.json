@@ -11,6 +11,20 @@
             "request": "launch",
             "program": "${workspaceFolder}/get_data.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Train",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train PL",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_pl.py",
+            "console": "integratedTerminal"
         }
     ]
 }

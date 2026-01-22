@@ -5,6 +5,7 @@ import mirdata
 import mir_eval.chord as mrc
 import math
 import librosa
+from util import map_to_majmin
 
 
 def compute_cqt(y, sr, hop_length, n_bins=84, bins_per_octave=12):
@@ -26,9 +27,6 @@ class BeatlesChordDataset(Dataset):
 
         all_track_ids = self.dataset.track_ids
 
-        # ---------------------------
-        # STEP 1 — Load only VALID audio tracks
-        # ---------------------------
         self._audio_arrays = {}
         self.track_ids = []     # only valid tracks
         self.lengths = {}
@@ -51,6 +49,7 @@ class BeatlesChordDataset(Dataset):
                     continue
                 y = audio[0]
                 sr = audio[1] if len(audio) > 1 else None
+                print(f"Loaded audio for track {tid} with sr={sr}")
             else:
                 y = audio
                 sr = None
@@ -70,12 +69,11 @@ class BeatlesChordDataset(Dataset):
             self.track_ids.append(tid)
             self.lengths[tid] = len(y)
             self.max_samples = max(self.max_samples, len(y))
+            
+        self.sample_rate = self._audio_arrays[self.track_ids[0]][1]  # assume uniform sr across tracks
 
         print(f"Loaded {len(self.track_ids)} tracks with valid audio.")
 
-        # ---------------------------
-        # STEP 2 — Build vocabulary from all chord labels
-        # ---------------------------
         all_labels = set()
         for tid in self.track_ids:
             track = self.dataset.track(tid)
@@ -85,15 +83,19 @@ class BeatlesChordDataset(Dataset):
         all_labels = sorted(all_labels)
 
         # numeric encodings
-        roots, bitmaps, basses = mrc.encode_many(all_labels)
-        encodings = []
-        for r, b, ba in zip(roots, bitmaps, basses):
-            encodings.append((int(r), tuple(b.tolist()), int(ba)))
+        # roots, bitmaps, basses = mrc.encode_many(all_labels)
+        # encodings = []
+        # for r, b, ba in zip(roots, bitmaps, basses):
+        #     encodings.append((int(r), tuple(b.tolist()), int(ba)))
 
-        self.encoding_to_idx = {enc: i for i, enc in enumerate(encodings)}
-        self.label_to_encoding = dict(zip(all_labels, encodings))
+        # self.encoding_to_idx = {enc: i for i, enc in enumerate(encodings)}
+        # self.label_to_encoding = dict(zip(all_labels, encodings))
+        
+        self.label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
+        self.idx_to_label = {i: lab for lab, i in self.label_to_idx.items()}
+        self.n_classes = len(all_labels)
 
-        print(f"Chord vocabulary size: {len(self.encoding_to_idx)} classes.")
+        print(f"Chord vocabulary size: {self.n_classes} classes.")
 
     @staticmethod
     def pad(arr, target_len):
@@ -120,20 +122,13 @@ class BeatlesChordDataset(Dataset):
         frame_times = np.arange(n_frames) / self.fps
 
         # start with NO_CHORD everywhere
-        no_enc = self.label_to_encoding[mrc.NO_CHORD]
-        no_idx = self.encoding_to_idx[no_enc]
+        no_idx = self.label_to_idx[mrc.NO_CHORD]
 
         frame_labels = np.full(n_frames, no_idx, dtype=np.int64)
 
         # Fill interval labels
         for (start, end), lab in zip(intervals, labels):
-            try:
-                r, b, ba = mrc.encode(lab)
-                enc = (int(r), tuple(b.tolist()), int(ba))
-                idx_c = self.encoding_to_idx[enc]
-            except Exception:
-                idx_c = no_idx
-
+            idx_c = self.label_to_idx.get(lab, no_idx)
             mask = (frame_times >= start) & (frame_times < end)
             frame_labels[mask] = idx_c
 
@@ -143,101 +138,176 @@ class BeatlesChordDataset(Dataset):
         )
 
 
-class FramewiseSpectrogramDataset(BeatlesChordDataset):
-    """
-    Wraps an existing dataset that returns (audio, frame_labels) where:
-      - audio is a 1D numpy array
-      - frame_labels is 1D numpy array of length n_frames (fps resolution)
-    This class converts audio -> CQT features and slices into segments of seg_frames.
-    Each item returned: (spec_segment, label_segment, valid_len)
-      - spec_segment: tensor (C=1, F, T_seg)  [float32]
-      - label_segment: tensor (T_seg,) with class indices
-      - valid_len: number of valid frames (for last shortened segment)
-    """
-    def __init__(self, base_dataset, fps=100, seg_seconds=8.0,
-                 n_bins=84, bins_per_octave=12, hop_length=None):
-        """
-        base_dataset: your BeatlesChordDataset (or similar) that yields (y, labels)
-        fps: frames per second for labels
-        seg_seconds: segment length in seconds for training windows
-        hop_length: samples between CQT frames; if None computed as sr // fps
-        """
-        self.base = base_dataset
+class BeatlesMajMinChordDataset(Dataset):
+    def __init__(self, root, fps=100):
+        self.dataset = mirdata.initialize("beatles", data_home=root)
         self.fps = fps
-        self.n_bins = n_bins
-        self.bins_per_octave = bins_per_octave
-        self.seg_frames = int(seg_seconds * fps)
-        self.hop_length = hop_length  # may be set per track if sr varies
 
-        # Build index: for each base track, how many segments it yields
-        self.index = []  # list of tuples (track_idx, seg_start_frame, n_valid_frames_in_segment)
-        for tidx in range(len(self.base)):
-            y, labels = self.base[tidx]  # base returns (y, label_frames)
-            # base may return torch tensors; convert to np
-            if isinstance(y, torch.Tensor):
-                y = y.numpy()
-            if isinstance(labels, torch.Tensor):
-                labels = labels.numpy()
+        all_track_ids = self.dataset.track_ids
 
-            # Need sr: try to get via base.dataset.track(...) if available
-            # We'll require base to expose its sampling rate in audio_map or so
-            # Try duck-typing: base has attribute audio_map dict tid->(y,sr) or _audio_arrays
-            sr = None
-            if hasattr(self.base, "_audio_arrays"):
-                # base.track_ids[idx] -> track id; but our base uses indices as tidx
-                # We attempt to get sr from cached audio
-                try:
-                    track_id = self.base.track_ids[tidx]
-                    sr = self.base._audio_arrays[track_id][1]
-                except Exception:
-                    sr = None
+        self._audio_arrays = {}
+        self.track_ids = []     # only valid tracks
+        self.lengths = {}
+        self.max_samples = 0
 
+        for tid in all_track_ids:
+            track = self.dataset.track(tid)
+
+            try:
+                audio = track.audio   # may raise
+            except Exception:
+                continue  # skip completely invalid entries
+
+            if audio is None:
+                continue
+
+            # audio may be (y, sr) or y-only
+            if isinstance(audio, (tuple, list)):
+                if len(audio) == 0:
+                    continue
+                y = audio[0]
+                sr = audio[1] if len(audio) > 1 else None
+                print(f"Loaded audio for track {tid} with sr={sr}")
+            else:
+                y = audio
+                sr = None
+
+            if y is None:
+                continue
+
+            y = np.asarray(y)
+
+            # fallback sample rate
             if sr is None:
-                sr = 44100
+                sr = getattr(track, "sample_rate", None) or \
+                     getattr(track, "sr", None) or 22050
 
-            hop = self.hop_length or max(1, int(round(sr / fps)))
-            # number of frames available in this track
-            n_frames = len(labels)
-            # compute number of segments starting positions (stride = seg_frames, non-overlapping)
-            start = 0
-            while start < n_frames:
-                valid = min(self.seg_frames, n_frames - start)
-                self.index.append((tidx, start, valid, sr, hop))
-                start += self.seg_frames  # non-overlapping; you could also slide by hop/2
+            # Cache audio
+            self._audio_arrays[tid] = (y, sr)
+            self.track_ids.append(tid)
+            self.lengths[tid] = len(y)
+            self.max_samples = max(self.max_samples, len(y))
+            
+        self.sample_rate = self._audio_arrays[self.track_ids[0]][1]  # assume uniform sr across tracks
+
+        print(f"Loaded {len(self.track_ids)} tracks with valid audio.")
+
+
+        all_labels = set()
+        for tid in self.track_ids:   # assuming your mirdata dataset
+            track = self.dataset.track(tid)
+            for lab in track.chords.labels:
+                mapped = map_to_majmin(lab)
+                if mapped is not None:  # ignore chords that cannot be mapped
+                    all_labels.add(mapped)
+
+        all_labels.add(mrc.NO_CHORD)
+        all_labels = sorted(all_labels)
+
+        # numeric encodings
+        # roots, bitmaps, basses = mrc.encode_many(all_labels)
+        # encodings = []
+        # for r, b, ba in zip(roots, bitmaps, basses):
+        #     encodings.append((int(r), tuple(b.tolist()), int(ba)))
+
+        # self.encoding_to_idx = {enc: i for i, enc in enumerate(encodings)}
+        # self.label_to_encoding = dict(zip(all_labels, encodings))
+        
+        self.label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
+        self.idx_to_label = {i: lab for lab, i in self.label_to_idx.items()}
+        self.n_classes = len(all_labels)
+
+        print(f"Chord vocabulary size: {self.n_classes} classes.")
+
+    @staticmethod
+    def pad(arr, target_len):
+        return np.pad(arr, (0, target_len - len(arr)), mode="constant")
 
     def __len__(self):
-        return len(self.index)
+        return len(self.track_ids)
 
     def __getitem__(self, idx):
-        tidx, start_frame, valid_frames, sr, hop = self.index[idx]
-        y, labels = self.base[tidx]
-        if isinstance(y, torch.Tensor):
-            y = y.numpy()
-        if isinstance(labels, torch.Tensor):
-            labels = labels.numpy()
+        track_id = self.track_ids[idx]
+        track = self.dataset.track(track_id)
 
-        # compute CQT for this track if necessary (we compute full CQT then slice frames)
-        # Compute once per __getitem__ (could be cached if you want)
-        spec = compute_cqt(y, sr, hop_length=hop, n_bins=self.n_bins,
-                           bins_per_octave=self.bins_per_octave)
-        # spec shape: (F, T_full)
-        # Ensure spec has sufficient frames: if short pad with -80 dB (log)
-        T_full = spec.shape[1]
-        required_end = start_frame + self.seg_frames
-        if required_end > T_full:
-            # pad on right with low values
-            pad_amount = required_end - T_full
-            pad = np.full((spec.shape[0], pad_amount), spec.min(), dtype=np.float32)
-            spec = np.concatenate([spec, pad], axis=1)
+        # Load cached audio
+        y, sr = self._audio_arrays[track_id]
+        y = self.pad(y, self.max_samples).astype(np.float32)
 
-        seg = spec[:, start_frame:start_frame + self.seg_frames]  # (F, T_seg)
-        seg = np.expand_dims(seg, axis=0)  # (1, F, T)
+        # Chord intervals
+        intervals = track.chords.intervals
+        labels = track.chords.labels
 
-        lbl_seg = np.zeros(self.seg_frames, dtype=np.int64)  # default 0 if needed
-        lbl_seg[:valid_frames] = labels[start_frame:start_frame + valid_frames]
-        # for frames beyond valid_frames (padding area), keep a sentinel (e.g., -100) or NO_CHORD idx
-        # We assume base labels include NO_CHORD index; otherwise use -1
-        if valid_frames < self.seg_frames:
-            lbl_seg[valid_frames:] = labels[start_frame + valid_frames - 1]  # or NO_CHORD
+        # Frame-wise time grid
+        duration = len(y) / sr
+        n_frames = math.ceil(duration * self.fps)
+        frame_times = np.arange(n_frames) / self.fps
 
-        return torch.from_numpy(seg), torch.from_numpy(lbl_seg), valid_frames
+        # start with NO_CHORD everywhere
+        no_idx = self.label_to_idx[mrc.NO_CHORD]
+
+        frame_labels = np.full(n_frames, no_idx, dtype=np.int64)
+
+        # Fill interval labels
+        for (start, end), lab in zip(intervals, labels):
+            idx_c = self.label_to_idx.get(map_to_majmin(lab), no_idx)
+            mask = (frame_times >= start) & (frame_times < end)
+            frame_labels[mask] = idx_c
+
+        return (
+            torch.from_numpy(y),
+            torch.from_numpy(frame_labels),
+        )
+
+
+class SegmentWrapper(torch.utils.data.Dataset):
+    """
+    Wrap a dataset that returns (audio, labels) and split each track
+    into fixed-length overlapping or non-overlapping segments.
+    """
+    def __init__(self, base_dataset, segment_seconds=8.0, hop_seconds=None):
+        self.base = base_dataset
+        self.fps = base_dataset.fps
+        self.sample_rate = base_dataset.sample_rate
+        self.seg_samples = int(segment_seconds * base_dataset.sample_rate)
+        self.hop_samples = int(hop_seconds * base_dataset.sample_rate) if hop_seconds is not None else self.seg_samples // 2
+        self.seg_frames = int(segment_seconds * self.base.fps)
+        self.hop_frames = int(hop_seconds * self.base.fps) if hop_seconds is not None else self.seg_frames // 2
+        # (dataset_index, start_sample)
+        self.index_map = []
+
+        for tid in range(len(base_dataset)):
+            audio, labels = base_dataset[tid]
+            total_samples = len(audio)
+
+            for start_sample in range(0, total_samples, self.hop_samples):
+                start_frame = int(start_sample * self.fps / self.sample_rate)
+
+                # stop if we exceed the label length entirely
+                if start_frame >= len(labels):
+                    break
+
+                self.index_map.append((tid, start_sample, start_frame))
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        tid, start_sample, start_frame = self.index_map[idx]
+
+        audio, labels = self.base[tid]
+
+        end_sample = start_sample + self.seg_samples
+        end_frame = start_frame + self.seg_frames
+        # Pad if segment exceeds track length
+        audio_seg = audio[start_sample:end_sample]
+        if len(audio_seg) < self.seg_samples:
+            pad = self.seg_samples - len(audio_seg)
+            audio_seg = torch.nn.functional.pad(audio_seg, (0, pad), mode="constant", value=0.0)
+
+        label_seg = labels[start_frame:end_frame]
+        if len(label_seg) < self.seg_frames:
+            pad = self.seg_frames - len(label_seg)
+            label_seg = torch.nn.functional.pad(label_seg, (0, pad), mode="constant", value=self.base.label_to_idx[mrc.NO_CHORD])
+
+        return audio_seg, label_seg

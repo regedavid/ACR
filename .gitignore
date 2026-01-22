@@ -45,4 +45,5 @@ Thumbs.db
 *.svl
 *.csv
 *.pyc
+lightning_logs/
 
