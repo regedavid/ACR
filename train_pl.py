@@ -1,6 +1,7 @@
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint # <--- 1. Import Callback
+from pytorch_lightning.loggers import TensorBoardLogger
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 import mir_eval.chord as mrc
@@ -223,6 +224,8 @@ if __name__ == "__main__":
                         help="Path to the Beatles dataset root folder")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--experiment_name", type=str, default="chord_model", 
+                        help="Name of the experiment for organizing logs and checkpoints")
     args = parser.parse_args()
 
     # Determine optimal workers
@@ -236,7 +239,7 @@ if __name__ == "__main__":
     print(f"Data Root: {args.data_dir}")
     print(f"Workers: {workers}")
 
-    ds = BeatlesMajMinChordDataset(args.data_dir, fps=100)
+    ds = BeatlesChordDataset(args.data_dir, fps=100)
     n_classes = len(ds.label_to_idx)
     no_idx = ds.label_to_idx[mrc.NO_CHORD]
 
@@ -265,13 +268,20 @@ if __name__ == "__main__":
     checkpoint_callback = ModelCheckpoint(
         monitor="val_acc",
         mode="max",
-        dirpath="checkpoints/",
-        filename="chord-model-{epoch:02d}-{val_acc:.2f}",
+        dirpath=f"checkpoints/{args.experiment_name}/",
+        filename="{epoch:02d}-{val_acc:.2f}",
         save_top_k=1,
         verbose=True,
     )
 
-    # 5. Trainer
+    # 5. Logger
+    logger = TensorBoardLogger(
+        save_dir="lightning_logs",
+        name=args.experiment_name,
+        default_hp_metric=False,
+    )
+
+    # 6. Trainer
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",  # Will use GPU if available, else CPU
@@ -279,11 +289,13 @@ if __name__ == "__main__":
         gradient_clip_val=1.0,
         log_every_n_steps=10,
         callbacks=[checkpoint_callback],
+        logger=logger,
     )
 
-    # 6. Train
+    # 7. Train
     trainer.fit(model, dm)
 
-    # 7. Final Save
-    trainer.save_checkpoint("final_chord_model.ckpt")
-    print("Training complete. Final model saved to 'final_chord_model.ckpt'")
+    # 8. Final Save
+    # final_checkpoint_path = f"checkpoints/{args.experiment_name}/final_model.ckpt"
+    # trainer.save_checkpoint(final_checkpoint_path)
+    # print(f"Training complete. Final model saved to '{final_checkpoint_path}'")
