@@ -25,6 +25,14 @@
             "request": "launch",
             "program": "${workspaceFolder}/train_pl.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Evaluate",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/predict_evaluate.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
 }

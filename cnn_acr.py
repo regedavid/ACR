@@ -1,5 +1,6 @@
 import math
 import torch
+import librosa
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -173,10 +174,13 @@ class TransformerEncoderModule(nn.Module):
         # x: (B, T, D)
         B, T, D = x.shape
         if T > self.pos_embed.size(1):
-            # if segment longer than pos_emb, expand by interpolation (rare)
-            # simple repeat or raise
-            raise ValueError(f"Sequence length {T} > pos_embed length {self.pos_embed.size(1)}")
-        pe = self.pos_embed[:, :T, :].to(x.dtype).to(x.device)
+            # Interpolate positional embeddings to match longer sequence lengths
+            pe = self.pos_embed.permute(0, 2, 1)  # (1, D, L)
+            pe = F.interpolate(pe, size=T, mode="linear", align_corners=False)
+            pe = pe.permute(0, 2, 1)  # (1, T, D)
+            pe = pe.to(x.dtype).to(x.device)
+        else:
+            pe = self.pos_embed[:, :T, :].to(x.dtype).to(x.device)
         x = x + pe
         return self.transformer(x, src_key_padding_mask=src_key_padding_mask)
 
@@ -231,3 +235,42 @@ class CNNTransformerChordModel(nn.Module):
         logits = self.classifier(x)
 
         return logits.squeeze(0) if single else logits  # keep consistent dims
+
+
+class HMMDecoder:
+    def __init__(self, transition_matrix):
+        """
+        transition_matrix: np.array of shape (n_classes, n_classes)
+        """
+        self.A = transition_matrix
+        # Pre-compute log transition matrix for Viterbi
+        # (librosa viterbi takes probabilities, but having them ready is good practice)
+        self.n_classes = transition_matrix.shape[0]
+
+    def decode(self, logits):
+        """
+        logits: Tensor of shape (T, n_classes) or (B, T, n_classes)
+        Returns: decoded_indices (T,) or (B, T)
+        """
+        # Handle batch dimension
+        if logits.dim() == 3:
+            # Loop over batch (Viterbi is not easily batchable in standard librosa)
+            batch_preds = []
+            for i in range(logits.shape[0]):
+                batch_preds.append(self.decode(logits[i]))
+            return np.stack(batch_preds)
+
+        # 1. Convert Logits to Probabilities
+        # Softmax gives P(Observation | State)
+        probs = F.softmax(logits, dim=-1).cpu().numpy() # Shape: (T, n_classes)
+        
+        # 2. Transpose for Librosa
+        # Librosa expects (n_classes, n_steps)
+        probs = probs.T 
+        
+        # 3. Run Viterbi
+        # p: State likelihoods
+        # transition: Transition matrix P(next|curr)
+        path = librosa.sequence.viterbi(probs, self.A)
+        
+        return path

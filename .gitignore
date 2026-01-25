@@ -48,5 +48,6 @@ Thumbs.db
 *.pkl
 *.ckpt
 *.slurm
+*.npy
 lightning_logs/
 
