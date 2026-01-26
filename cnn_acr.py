@@ -237,6 +237,63 @@ class CNNTransformerChordModel(nn.Module):
         return logits.squeeze(0) if single else logits  # keep consistent dims
 
 
+class MultiHeadChordModel(nn.Module):
+    def __init__(
+        self,
+        n_roots: int,
+        n_qualities: int,
+        n_bass: int,
+        sample_rate: int = 44100,
+        fps: int = 100,
+        n_mels: int = 128,
+        n_fft: int = 2048,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 4,
+        freq_channels=[64,128,256],
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.frontend = MelFrontend(sample_rate=sample_rate, fps=fps, n_mels=n_mels, n_fft=n_fft)
+        self.cnn = CNNEncoder(n_mels=n_mels, d_model=d_model, chans=freq_channels)
+        self.transformer = TransformerEncoderModule(d_model=d_model, nhead=nhead, num_layers=num_layers,
+                                                    dim_feedforward=d_model*4, dropout=dropout)
+        self.classifiers = nn.ModuleList([
+            nn.Linear(d_model, n_roots),
+            nn.Linear(d_model, n_qualities),
+            nn.Linear(d_model, n_bass),
+        ])
+        self._n_roots = n_roots
+        self._n_qualities = n_qualities
+        self._n_bass = n_bass
+        self._fps = fps
+
+    def forward(self, audio):
+        """
+        audio: Tensor (B, seg_samples) or (seg_samples,) -> returns list of logits [(B, T, n_classes_i), ...]
+        """
+        single = False
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+            single = True
+
+        # Shared forward
+        mel = self.shared_model.frontend(audio)  # (B, n_mels, T)
+        mel = mel.to(audio.dtype).to(audio.device)
+        mel = mel.unsqueeze(1)
+        x = self.shared_model.cnn(mel)
+        x = self.shared_model.transformer(x)
+
+        # Multiple classifiers
+        roots_logits = self.classifiers[0](x)
+        qualities_logits = self.classifiers[1](x)
+        bass_logits = self.classifiers[2](x)
+
+        return roots_logits.squeeze(0) if single else roots_logits, \
+               qualities_logits.squeeze(0) if single else qualities_logits, \
+               bass_logits.squeeze(0) if single else bass_logits
+
+
 class HMMDecoder:
     def __init__(self, transition_matrix):
         """
