@@ -1190,7 +1190,7 @@ if __name__ == "__main__":
     
     track_result = BatchChordEvaluator(predictor, ds).evaluate_track(
         track_id, 
-        metrics=["mirex", "root", "majmin"],
+        metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv"],
         save_lab=f"predictions/{track_id}.lab"
     )
     print(f"Track: {track_result['track_id']}")
@@ -1245,7 +1245,7 @@ if __name__ == "__main__":
         root_dir="dataset_eval",
         audio_ext=".wav",      # Finds first .wav in each subdirectory
         lab_ext=".lab",        # Finds first .lab in each subdirectory
-        metrics=["mirex", "root", "majmin"],
+        metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv"],
         save_lab_dir="predictions/custom_dataset",
         target_sr=44100
     )
