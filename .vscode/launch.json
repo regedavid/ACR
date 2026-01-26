@@ -27,10 +27,26 @@
             "console": "integratedTerminal"
         },
         {
+            "name": "Train PL + External",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_pl.py",
+            "console": "integratedTerminal",
+            "args": ["--external_root", "${workspaceFolder}/dataset_eval"]
+        },
+        {
             "name": "Evaluate",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/predict_evaluate.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "test dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/custom_dataset.py",
             "console": "integratedTerminal",
             "justMyCode": false
         }

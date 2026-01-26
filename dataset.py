@@ -110,7 +110,7 @@ class BeatlesChordDataset(Dataset):
 
         # Load cached audio
         y, sr = self._audio_arrays[track_id]
-        y = self.pad(y, self.max_samples).astype(np.float32)
+        #y = self.pad(y, self.max_samples).astype(np.float32)
 
         # Chord intervals
         intervals = track.chords.intervals

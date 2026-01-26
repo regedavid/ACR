@@ -14,6 +14,7 @@ import argparse
 # ---------------------------
 from cnn_acr import CNNTransformerChordModel
 from dataset import BeatlesChordDataset, BeatlesMajMinChordDataset, SegmentWrapper
+from custom_dataset import build_combined_dataset
 
 # ===========================================================
 # 1) LightningModule for the CNN+Transformer chord estimator
@@ -222,6 +223,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Chord Model Locally")
     parser.add_argument("--data_dir", type=str, default="./mir_datasets2/beatles", 
                         help="Path to the Beatles dataset root folder")
+    parser.add_argument("--external_root", type=str, default=None, 
+                        help="Path to external dataset folder (e.g., dataset_eval). If provided, will combine with Beatles data.")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--experiment_name", type=str, default="chord_model", 
@@ -239,9 +242,23 @@ if __name__ == "__main__":
     print(f"Data Root: {args.data_dir}")
     print(f"Workers: {workers}")
 
-    ds = BeatlesChordDataset(args.data_dir, fps=100)
+    # Use combined dataset if external_root is provided, otherwise just Beatles
+    if args.external_root:
+        print(f"Using combined dataset: Beatles + External ({args.external_root})")
+        ds, label_to_idx, idx_to_label = build_combined_dataset(
+            beatles_root=args.data_dir,
+            external_root=args.external_root,
+            fps=100,
+            sample_rate=None  # Will use Beatles sample rate
+        )
+        print(f"Combined dataset: {len(ds)} total tracks")
+    else:
+        print("Using Beatles dataset only")
+        ds = BeatlesChordDataset(args.data_dir, fps=100)
+    
     n_classes = len(ds.label_to_idx)
     no_idx = ds.label_to_idx[mrc.NO_CHORD]
+    print(f"Number of chord classes: {n_classes}")
 
     # 2. Initialize Model
     model = LightningChordModel(
