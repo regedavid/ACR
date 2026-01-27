@@ -22,7 +22,7 @@ from custom_dataset import build_combined_dataset
 class LightningChordModel(pl.LightningModule):
     def __init__(
         self,
-        n_classes,
+        n_classes=None,
         lr=3e-4,
         sample_rate=44100,
         fps=100,
@@ -30,6 +30,7 @@ class LightningChordModel(pl.LightningModule):
         ignore_index=-100,
         multi_target=False,
         n_roots=None, n_qualities=None, n_basses=None,
+        ignore_root=-100, ignore_qual=-100, ignore_bass=-100,
         **model_kwargs,
     ):
         super().__init__()
@@ -198,7 +199,7 @@ class ChordDataModule(pl.LightningDataModule):
         self.setup_done = True
 
         # Weight calculation and caching
-        no_idx = self.base_dataset.label_to_idx[mrc.NO_CHORD]
+        
         if self.segment_seconds == 8.0:
             cache_path = os.path.join(self.root, ".segment_weights.pkl")
         elif self.segment_seconds == 20.0:
@@ -209,6 +210,7 @@ class ChordDataModule(pl.LightningDataModule):
             with open(cache_path, "rb") as f:
                 sample_weights = pickle.load(f)
         else:
+            no_idx = self.base_dataset.label_to_idx[mrc.NO_CHORD]
             print("Calculating segment weights... (this may take a minute)")
             # Use 0 workers for calculation to avoid overhead/pickling issues
             dl = DataLoader(full, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
@@ -296,7 +298,7 @@ if __name__ == "__main__":
                         help="Number of CQT bins (only used if --frontend=cqt)")
     parser.add_argument("--segment_seconds", type=float, default=8.0,
                         help="Segment length in seconds for training")
-    parser.add_argument("--multi_layer", action="store_true", default=False,
+    parser.add_argument("--multi_layer", action="store_true",
                         help="Enable multi-task learning (Root, Quality, Bass)")
     args = parser.parse_args()
 
@@ -335,9 +337,7 @@ if __name__ == "__main__":
         print("Using Beatles dataset only")
         ds = BeatlesChordDataset(args.data_dir, fps=100, multi_target=args.multi_layer)
     
-    n_classes = len(ds.label_to_idx)
-    no_idx = ds.label_to_idx[mrc.NO_CHORD]
-    print(f"Number of chord classes: {n_classes}")
+        
     print(f"Using {args.frontend.upper()} frontend")
 
     # Build frontend-specific kwargs
@@ -354,6 +354,9 @@ if __name__ == "__main__":
             n_roots=ds.n_roots,
             n_qualities=ds.n_qualities,
             n_basses=ds.n_bass,
+            ignore_bass=-100,
+            ignore_qual=-100,
+            ignore_root=-100,
             # Common args
             lr=3e-4,
             frontend_type=args.frontend,
@@ -370,7 +373,7 @@ if __name__ == "__main__":
         model = LightningChordModel(
             multi_target=False,
             n_classes=ds.n_classes,
-            ignore_index=no_idx,
+            ignore_index=-100,
             # Common args
             lr=3e-4,
             frontend_type=args.frontend,

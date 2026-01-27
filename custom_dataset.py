@@ -181,13 +181,54 @@ class UnifiedConcatDataset(ConcatDataset):
     ConcatDataset with shared vocabulary and dataset attributes.
     Makes it a drop-in replacement for BeatlesChordDataset.
     """
-    def __init__(self, datasets, label_to_idx, idx_to_label, fps, sample_rate):
+    def __init__(self,
+                datasets,
+                fps,
+                sample_rate,
+                label_to_idx=None, 
+                idx_to_label=None,
+                root2idx=None,
+                qual2idx=None,
+                bass2idx=None,
+                idx2root=None,
+                idx2qual=None,
+                idx2bass=None,
+            ):
         super().__init__(datasets)
-        self.label_to_idx = label_to_idx
-        self.idx_to_label = idx_to_label
-        self.n_classes = len(label_to_idx)
         self.fps = fps
         self.sample_rate = sample_rate
+
+        # --- Single Target Attributes ---
+        self.label_to_idx = label_to_idx
+        self.idx_to_label = idx_to_label
+        if self.label_to_idx:
+            self.n_classes = len(self.label_to_idx)
+        else:
+            self.n_classes = None
+
+        # --- Multi Target Attributes ---
+        self.root2idx = root2idx
+        self.qual2idx = qual2idx
+        self.bass2idx = bass2idx
+        
+        self.idx2root = idx2root
+        self.idx2qual = idx2qual
+        self.idx2bass = idx2bass
+
+        if self.root2idx:
+            # Counts
+            self.n_roots = len(self.root2idx)
+            self.n_qualities = len(self.qual2idx)
+            self.n_bass = len(self.bass2idx)
+            
+            # Ignore Indices (Safe lookup for "N")
+            self.n_root_idx = self.root2idx.get("N", 0)
+            self.n_qual_idx = self.qual2idx.get("N", 0)
+            self.n_bass_idx = self.bass2idx.get("N", 0)
+        else:
+            self.n_roots = None
+            self.n_qualities = None
+            self.n_bass = None
 
 
 def pad_collate_fn(batch, pad_label_idx=0):
@@ -250,133 +291,84 @@ def pad_collate_fn(batch, pad_label_idx=0):
 
 
 def build_combined_dataset(beatles_root, external_root, fps=100, sample_rate=None, multi_target=False):
-    """
-    Build Beatles + external chord datasets with a unified vocabulary.
-    Supports both Single-Target and Multi-Target (Root, Quality, Bass) modes.
-    """
-    
-    # 1. Load Beatles (it builds its own initial vocab)
+    # 1. Load Beatles
     beatles_ds = BeatlesChordDataset(root=beatles_root, fps=fps, multi_target=multi_target)
-
+    
     # 2. Collect External Labels
     external_labels = collect_external_labels(external_root)
-
-    # Use provided sample_rate or fallback to Beatles SR
     ext_sr = sample_rate if sample_rate is not None else beatles_ds.sample_rate
 
     if multi_target:
-        # ---------------------------------------------------------
-        # MULTI-TARGET MODE (Root, Quality, Bass)
-        # ---------------------------------------------------------
-        
-        # A. Decompose external labels into sets
+        # --- Multi-Target Logic ---
         ext_roots, ext_quals, ext_basses = set(), set(), set()
         for lab in external_labels:
             r, q, b = decompose_label(lab)
-            ext_roots.add(r)
-            ext_quals.add(q)
-            ext_basses.add(b)
-            
-        # B. Merge with Beatles vocab (accessing internal keys)
-        # We start with the Beatles keys, add external keys, AND force "N"
+            ext_roots.add(r); ext_quals.add(q); ext_basses.add(b)
+
+        # Merge & Force "N"
         all_roots = set(beatles_ds.root2idx.keys()) | ext_roots | {"N"}
         all_quals = set(beatles_ds.qual2idx.keys()) | ext_quals | {"N"}
         all_basses = set(beatles_ds.bass2idx.keys()) | ext_basses | {"N"}
-        
-        # C. Create Unified Maps (Sorted for determinism)
+
+        # Create Maps
         root2idx = {r: i for i, r in enumerate(sorted(all_roots))}
         qual2idx = {q: i for i, q in enumerate(sorted(all_quals))}
         bass2idx = {b: i for i, b in enumerate(sorted(all_basses))}
         
-        # D. Create Inverse Maps (Needed for Inference)
         idx2root = {i: r for r, i in root2idx.items()}
         idx2qual = {i: q for q, i in qual2idx.items()}
         idx2bass = {i: b for b, i in bass2idx.items()}
-        
-        # E. Update Beatles Dataset with Unified Vocab
+
+        # Update Beatles
         beatles_ds.root2idx = root2idx
         beatles_ds.qual2idx = qual2idx
         beatles_ds.bass2idx = bass2idx
-        
-        beatles_ds.idx2root = idx2root
-        beatles_ds.idx2qual = idx2qual
-        beatles_ds.idx2bass = idx2bass
-        
-        beatles_ds.n_roots = len(root2idx)
-        beatles_ds.n_qualities = len(qual2idx)
-        beatles_ds.n_bass = len(bass2idx)
-        
-        # Update "N" indices (since sorting might have changed indices)
+        # (We don't strictly need to update beatles_ds.n_roots etc. anymore 
+        #  because we read from 'combined', but it's good practice)
         beatles_ds.n_root_idx = root2idx["N"]
         beatles_ds.n_qual_idx = qual2idx["N"]
         beatles_ds.n_bass_idx = bass2idx["N"]
-        
-        # F. Create External Dataset
+
+        # Create External
         extra_ds = ExternalChordDataset(
-            external_root, 
-            fps=fps, 
-            sample_rate=ext_sr,
+            external_root, fps=fps, sample_rate=ext_sr,
             multi_target=True,
-            root2idx=root2idx, 
-            qual2idx=qual2idx, 
-            bass2idx=bass2idx
+            root2idx=root2idx, qual2idx=qual2idx, bass2idx=bass2idx
         )
-        
-        # G. Create Combined Dataset
+
+        # Create Unified Wrapper (PASS EVERYTHING HERE)
         combined = UnifiedConcatDataset(
             datasets=[beatles_ds, extra_ds],
-            label_to_idx=None, # Not used in multi-target
-            idx_to_label=None,
             fps=fps,
             sample_rate=ext_sr,
+            root2idx=root2idx, qual2idx=qual2idx, bass2idx=bass2idx,
+            idx2root=idx2root, idx2qual=idx2qual, idx2bass=idx2bass
         )
-        
-        # Attach maps to combined instance for easy access in train script
-        combined.root2idx = root2idx
-        combined.qual2idx = qual2idx
-        combined.bass2idx = bass2idx
-        combined.idx2root = idx2root
-        combined.idx2qual = idx2qual
-        combined.idx2bass = idx2bass
         
         return combined, root2idx, qual2idx, bass2idx
 
     else:
-        # ---------------------------------------------------------
-        # SINGLE-TARGET MODE (Standard Classification)
-        # ---------------------------------------------------------
-        
-        # A. Merge Vocabularies
+        # --- Single-Target Logic ---
         all_labels = sorted(set(beatles_ds.label_to_idx.keys()) | external_labels)
-        
-        # B. Create Maps
         label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
         idx_to_label = {i: lab for lab, i in label_to_idx.items()}
 
-        # C. Update Beatles Dataset
         beatles_ds.label_to_idx = label_to_idx
         beatles_ds.idx_to_label = idx_to_label
-        beatles_ds.n_classes = len(label_to_idx)
 
-        # D. Create External Dataset
         extra_ds = ExternalChordDataset(
-            external_root,
-            fps=fps,
-            sample_rate=ext_sr,
-            multi_target=False,
-            label_to_idx=label_to_idx,
+            external_root, fps=fps, sample_rate=ext_sr,
+            multi_target=False, label_to_idx=label_to_idx,
         )
 
-        # E. Create Combined Dataset
         combined = UnifiedConcatDataset(
             datasets=[beatles_ds, extra_ds],
-            label_to_idx=label_to_idx,
-            idx_to_label=idx_to_label,
             fps=fps,
             sample_rate=ext_sr,
+            label_to_idx=label_to_idx,
+            idx_to_label=idx_to_label
         )
         
-        # Return standard maps, plus None for the multi-target maps
         return combined, label_to_idx, idx_to_label, None
 
 

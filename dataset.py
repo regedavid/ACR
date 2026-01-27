@@ -127,13 +127,17 @@ class BeatlesChordDataset(Dataset):
             self.n_roots = len(self.root2idx)
             self.n_qualities = len(self.qual2idx)
             self.n_bass = len(self.bass2idx)
+            
+            self.n_root_idx = self.root2idx.get("N")
+            self.n_qual_idx = self.qual2idx.get("N")
+            self.n_bass_idx = self.bass2idx.get("N")
+            
             print(f"Multi-Target Vocabs: {self.n_roots} Roots, {self.n_qualities} Qualities, {self.n_bass} Basses")
         else:
             self.label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
             self.idx_to_label = {i: lab for lab, i in self.label_to_idx.items()}
             self.n_classes = len(all_labels)
-
-        print(f"Chord vocabulary size: {self.n_classes} classes.")
+            print(f"Chord vocabulary size: {self.n_classes} classes.")
 
     @staticmethod
     def pad(arr, target_len):
@@ -159,29 +163,40 @@ class BeatlesChordDataset(Dataset):
         n_frames = math.ceil(duration * self.fps)
         frame_times = np.arange(n_frames) / self.fps
 
-        # start with NO_CHORD everywhere
-        no_idx = self.label_to_idx[mrc.NO_CHORD]
-
-        frame_labels = np.full(n_frames, no_idx, dtype=np.int64)
-
         if self.multi_target:
-            # Create 3 tensor arrays
-            root_labels = np.zeros(n_frames, dtype=np.int64)
-            qual_labels = np.zeros(n_frames, dtype=np.int64)
-            bass_labels = np.zeros(n_frames, dtype=np.int64)
+            # === MULTI-TARGET MODE ===
+            # Initialize with specific NO_CHORD indices for each head
+            # (We use the pre-calculated indices from __init__)
+            root_labels = np.full(n_frames, self.n_root_idx, dtype=np.int64)
+            qual_labels = np.full(n_frames, self.n_qual_idx, dtype=np.int64)
+            bass_labels = np.full(n_frames, self.n_bass_idx, dtype=np.int64)
             
-            # Fill them
+            # Fill labels
             for (start, end), lab in zip(intervals, labels):
                 r_str, q_str, b_str = decompose_label(lab)
-                mask = (frame_times >= start) & (frame_times < end)
                 
-                root_labels[mask] = self.root2idx.get(r_str, 0)
-                qual_labels[mask] = self.qual2idx.get(q_str, 0)
-                bass_labels[mask] = self.bass2idx.get(b_str, 0)
+                # Safe lookup: if chord part not in vocab, default to "N" index
+                r_idx = self.root2idx.get(r_str, self.n_root_idx)
+                q_idx = self.qual2idx.get(q_str, self.n_qual_idx)
+                b_idx = self.bass2idx.get(b_str, self.n_bass_idx)
+                
+                mask = (frame_times >= start) & (frame_times < end)
+                root_labels[mask] = r_idx
+                qual_labels[mask] = q_idx
+                bass_labels[mask] = b_idx
 
-            return torch.from_numpy(y), (torch.from_numpy(root_labels), torch.from_numpy(qual_labels), torch.from_numpy(bass_labels))
+            return (
+                torch.from_numpy(y),
+                (torch.from_numpy(root_labels), torch.from_numpy(qual_labels), torch.from_numpy(bass_labels))
+            )
+
         else:
-            # Fill interval labels
+            # === SINGLE-TARGET MODE ===
+            # Only access label_to_idx here!
+            no_idx = self.label_to_idx[mrc.NO_CHORD]
+            frame_labels = np.full(n_frames, no_idx, dtype=np.int64)
+
+            # Fill labels
             for (start, end), lab in zip(intervals, labels):
                 idx_c = self.label_to_idx.get(lab, no_idx)
                 mask = (frame_times >= start) & (frame_times < end)
@@ -315,31 +330,45 @@ class BeatlesMajMinChordDataset(Dataset):
         )
 
 
-class SegmentWrapper(torch.utils.data.Dataset):
-    """
-    Wrap a dataset that returns (audio, labels) and split each track
-    into fixed-length overlapping or non-overlapping segments.
-    """
+class SegmentWrapper(Dataset):
     def __init__(self, base_dataset, segment_seconds=8.0, hop_seconds=None):
         self.base = base_dataset
         self.fps = base_dataset.fps
         self.sample_rate = base_dataset.sample_rate
-        self.seg_samples = int(segment_seconds * base_dataset.sample_rate)
-        self.hop_samples = int(hop_seconds * base_dataset.sample_rate) if hop_seconds is not None else self.seg_samples // 2
-        self.seg_frames = int(segment_seconds * self.base.fps)
-        self.hop_frames = int(hop_seconds * self.base.fps) if hop_seconds is not None else self.seg_frames // 2
-        # (dataset_index, start_sample)
+        self.seg_samples = int(segment_seconds * self.sample_rate)
+        self.hop_samples = int(hop_seconds * self.sample_rate) if hop_seconds is not None else self.seg_samples // 2
+        self.seg_frames = int(segment_seconds * self.fps)
+        
         self.index_map = []
-
         for tid in range(len(base_dataset)):
-            audio, labels = base_dataset[tid]
-            total_samples = len(audio)
+            # Robust length checking
+            if hasattr(base_dataset, "lengths"):
+                total_samples = base_dataset.lengths[base_dataset.track_ids[tid]]
+            else:
+                # Fallback that loads audio (slower but safe)
+                audio, labels = base_dataset[tid] 
+                total_samples = len(audio)
+            
+            # --- FIX: Determine correct label length ---
+            # We need to peek at the labels to know when to stop
+            # (We assume base_dataset[tid] returns (audio, labels))
+            # Ideally we wouldn't load this every time, but for safety:
+            _, labels = base_dataset[tid]
+            
+            if isinstance(labels, (tuple, list)):
+                # Multi-target: labels is (root, qual, bass)
+                # We check the length of the first tensor
+                label_len = len(labels[0])
+            else:
+                # Single-target: labels is a tensor
+                label_len = len(labels)
+            # -------------------------------------------
 
             for start_sample in range(0, total_samples, self.hop_samples):
                 start_frame = int(start_sample * self.fps / self.sample_rate)
 
-                # stop if we exceed the label length entirely
-                if start_frame >= len(labels):
+                # Stop if we are past the end of the labels
+                if start_frame >= label_len:
                     break
 
                 self.index_map.append((tid, start_sample, start_frame))
@@ -349,34 +378,47 @@ class SegmentWrapper(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         tid, start_sample, start_frame = self.index_map[idx]
-
         audio, labels = self.base[tid]
 
+        # 1. Audio Slicing & Padding
         end_sample = start_sample + self.seg_samples
-        end_frame = start_frame + self.seg_frames
-        # Pad if segment exceeds track length
         audio_seg = audio[start_sample:end_sample]
         if len(audio_seg) < self.seg_samples:
             pad = self.seg_samples - len(audio_seg)
             audio_seg = torch.nn.functional.pad(audio_seg, (0, pad), mode="constant", value=0.0)
 
-        if isinstance(labels, tuple): # Multi-target case
+        # 2. Label Slicing & Padding
+        end_frame = start_frame + self.seg_frames
+
+        if isinstance(labels, (tuple, list)):
+            # --- MULTI-TARGET ---
+            # labels is (root_tensor, qual_tensor, bass_tensor)
             root_seg, qual_seg, bass_seg = labels
             
-            # Helper to slice and pad
-            def slice_pad(tensor_data):
-                seg = tensor_data[start_frame:end_frame]
+            # Use specific padding values from base dataset
+            pad_r = getattr(self.base, "n_root_idx", 0)
+            pad_q = getattr(self.base, "n_qual_idx", 0)
+            pad_b = getattr(self.base, "n_bass_idx", 0)
+            
+            def pad_tensor(t, val):
+                seg = t[start_frame:end_frame]
                 if len(seg) < self.seg_frames:
-                    pad = self.seg_frames - len(seg)
-                    # Use 0 (usually No Chord) for padding
-                    seg = torch.nn.functional.pad(seg, (0, pad), mode="constant", value=0)
+                    p = self.seg_frames - len(seg)
+                    seg = torch.nn.functional.pad(seg, (0, p), mode="constant", value=val)
                 return seg
             
-            return audio_seg, (slice_pad(root_seg), slice_pad(qual_seg), slice_pad(bass_seg))
+            return audio_seg, (pad_tensor(root_seg, pad_r), pad_tensor(qual_seg, pad_q), pad_tensor(bass_seg, pad_b))
+            
         else:
+            # --- SINGLE-TARGET ---
             label_seg = labels[start_frame:end_frame]
             if len(label_seg) < self.seg_frames:
+                # Try to get NO_CHORD index from base
+                pad_val = 0
+                if hasattr(self.base, "label_to_idx") and self.base.label_to_idx:
+                    pad_val = self.base.label_to_idx.get(mrc.NO_CHORD, 0)
+                
                 pad = self.seg_frames - len(label_seg)
-                label_seg = torch.nn.functional.pad(label_seg, (0, pad), mode="constant", value=self.base.label_to_idx[mrc.NO_CHORD])
-
+                label_seg = torch.nn.functional.pad(label_seg, (0, pad), mode="constant", value=pad_val)
+            
             return audio_seg, label_seg
