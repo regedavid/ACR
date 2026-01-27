@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import numpy as np
 import math
 import os
+import json
 import librosa
 from typing import Dict, List, Tuple, Optional, Union
 import mir_eval.chord as mrc
@@ -22,6 +23,7 @@ from dataset import BeatlesChordDataset, BeatlesMajMinChordDataset
 from train_pl import LightningChordModel
 import pytorch_lightning as pl
 from hmm_utils import get_transition_matrix, make_transition_matrix_sticky
+from custom_dataset import build_combined_dataset, UnifiedConcatDataset
 
 
 class ChordPredictor:
@@ -525,6 +527,11 @@ class ChordEvaluator:
         
         # Use mir_eval's built-in evaluate function which handles interval alignment
         try:
+            # est_intervals, est_labels = mrc.util.adjust_intervals(
+            #     est_intervals, est_labels, 
+            #     ref_intervals.min(), ref_intervals.max(),
+            #     mrc.NO_CHORD, mrc.NO_CHORD
+            # )
             scores = mrc.evaluate(ref_intervals, ref_labels, est_intervals, est_labels)
         except Exception as e:
             print(f"Warning: evaluate() failed: {e}. Trying individual metrics...")
@@ -1135,7 +1142,7 @@ class CustomDatasetEvaluator:
 # Convenience functions
 def load_predictor_from_checkpoint(
     checkpoint_path: str,
-    dataset: Union[BeatlesChordDataset, BeatlesMajMinChordDataset],
+    dataset: Union[BeatlesChordDataset, BeatlesMajMinChordDataset, UnifiedConcatDataset],
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> ChordPredictor:
     """
@@ -1159,46 +1166,64 @@ def load_predictor_from_checkpoint(
 
 if __name__ == "__main__":
     # Example usage for prediction and evaluation
-    
+    extended_ds = True
     # 1. Load dataset and predictor
     print("Loading dataset and model...")
-    ds = BeatlesChordDataset("./mir_datasets2/beatles")
+    
+    if extended_ds:
+        ds, label_to_idx, idx_to_label = build_combined_dataset(
+            beatles_root='./mir_datasets2/beatles',
+            external_root='./dataset_ext',
+            fps=100,
+            sample_rate=None  # Will use Beatles sample rate
+        )
+        predictor = load_predictor_from_checkpoint("model_ep-100_ext.ckpt", ds)
 
-    transition_matrix = np.load("trans_matrix.npy") # Load it next time
+        if not os.path.exists("transition_matrix_ext.npy"):
+            transition_matrix = get_transition_matrix(ds, ds.n_classes)
+            np.save("transition_matrix_ext.npy", transition_matrix)
+        else:
+            transition_matrix = np.load("transition_matrix_ext.npy")
+    else:
+        ds = BeatlesChordDataset("./mir_datasets2/beatles")
+        predictor = load_predictor_from_checkpoint("best_model.ckpt", ds)
+        transition_matrix = np.load("trans_matrix.npy") # Load it next time
+    
+    # Validate transition matrix shape matches model classes
+        
     transition_matrix = make_transition_matrix_sticky(transition_matrix, self_prob=0.99)
-    predictor = load_predictor_from_checkpoint("best_model.ckpt", ds)
     predictor.transition_matrix = transition_matrix
     
     print(f"Loaded model with {ds.n_classes} chord classes\n")
     
-    # 2. Single track prediction
-    print("=" * 60)
-    print("SINGLE TRACK PREDICTION")
-    print("=" * 60)
-    track_id = ds.track_ids[0]
-    print(f"Predicting on track: {track_id}")
-    pred_labels, confidences, duration = predictor.predict_from_track(ds, track_id)
-    print(f"  Duration: {duration:.2f}s")
-    print(f"  Predicted frames: {len(pred_labels)}")
-    print(f"  Mean confidence: {np.mean(confidences):.3f}\n")
+    # # 2. Single track prediction
+    # print("=" * 60)
+    # print("SINGLE TRACK PREDICTION")
+    # print("=" * 60)
+    # track_id = ds.track_ids[0]
+    # print(f"Predicting on track: {track_id}")
+    # pred_labels, confidences, duration = predictor.predict_from_track(ds, track_id)
+    # print(f"  Duration: {duration:.2f}s")
+    # print(f"  Predicted frames: {len(pred_labels)}")
+    # print(f"  Mean confidence: {np.mean(confidences):.3f}\n")
     
-    # 3. Single track evaluation with .lab file
-    print("=" * 60)
-    print("SINGLE TRACK EVALUATION")
-    print("=" * 60)
-    evaluator = ChordEvaluator(fps=100)
+    # # 3. Single track evaluation with .lab file
+    # print("=" * 60)
+    # print("SINGLE TRACK EVALUATION")
+    # print("=" * 60)
+    # evaluator = ChordEvaluator(fps=100)
     
-    track_result = BatchChordEvaluator(predictor, ds).evaluate_track(
-        track_id, 
-        metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv"],
-        save_lab=f"predictions/{track_id}.lab"
-    )
-    print(f"Track: {track_result['track_id']}")
-    print(f"Metrics:")
-    for metric, score in track_result["metrics"].items():
-        if score is not None:
-            print(f"  {metric}: {score:.3f}")
-    print(f"Mean confidence: {track_result['mean_confidence']:.3f}\n")
+    # track_result = BatchChordEvaluator(predictor, ds).evaluate_track(
+    #     track_id, 
+    #     metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv"],
+    #     save_lab=f"predictions/{track_id}.lab"
+    # )
+    # print(f"Track: {track_result['track_id']}")
+    # print(f"Metrics:")
+    # for metric, score in track_result["metrics"].items():
+    #     if score is not None:
+    #         print(f"  {metric}: {score:.3f}")
+    # print(f"Mean confidence: {track_result['mean_confidence']:.3f}\n")
     
     # # 4. Batch evaluation on multiple tracks with .lab export
     # print("=" * 60)
@@ -1242,11 +1267,11 @@ if __name__ == "__main__":
     
     # Option 1: Auto-detect files by extension
     custom_results = custom_eval.evaluate_nested_directories(
-        root_dir="dataset_eval",
+        root_dir="test_ds",
         audio_ext=".wav",      # Finds first .wav in each subdirectory
         lab_ext=".lab",        # Finds first .lab in each subdirectory
-        metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv"],
-        save_lab_dir="predictions/custom_dataset",
+        metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv", "overseg", "underseg", "seg"],
+        save_lab_dir="predictions/extended_dataset",
         target_sr=44100
     )
     
@@ -1255,23 +1280,62 @@ if __name__ == "__main__":
     #     root_dir="dataset_eval",
     #     audio_filename="audio.wav",        # Exact audio filename
     #     lab_filename="annotation.lab",     # Exact lab filename
-    #     metrics=["mirex", "root", "majmin"],
+    #     metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv", "overseg", "underseg", "seg"],
     #     save_lab_dir="predictions/custom_dataset"
     # )
     
     # Print custom dataset results
     print(f"\nEvaluated {custom_results['num_files_evaluated']} files\n")
+    print("Aggregate Statistics:")
     for metric, stats in custom_results["aggregate_stats"].items():
         print(f"{metric.upper()}:")
-        print(f"  Mean:  {stats['mean']:.3f}")
-        print(f"  Std:   {stats['std']:.3f}\n")
+        print(f"  Mean:  {stats['mean']:.4f}")
+        print(f"  Std:   {stats['std']:.4f}")
+        print(f"  Min:   {stats['min']:.4f}")
+        print(f"  Max:   {stats['max']:.4f}\n")
     
-    # Show per-subdirectory results
-    print("Per-subdirectory results:")
+    # Show per-subdirectory results with key metrics
+    print("\nPer-subdirectory results:")
+    print(f"{'Subdirectory':40s} | {'MIREX':>7s} | {'Root':>7s} | {'MajMin':>7s} | {'OverSeg':>7s} | {'UnderSeg':>7s} | {'Seg':>7s}")
+    print("-" * 110)
     for file_result in custom_results["file_results"]:
         subdir = file_result.get('subdirectory', 'unknown')
-        mirex = file_result['metrics'].get('mirex', 0)
-        print(f"  {subdir:30s} | MIREX: {mirex:.3f}")
+        mirex = file_result['metrics'].get('mirex', None)
+        root = file_result['metrics'].get('root', None)
+        majmin = file_result['metrics'].get('majmin', None)
+        overseg = file_result['metrics'].get('overseg', None)
+        underseg = file_result['metrics'].get('underseg', None)
+        seg = file_result['metrics'].get('seg', None)
+        
+        mirex_str = f"{mirex:.4f}" if mirex is not None else "N/A"
+        root_str = f"{root:.4f}" if root is not None else "N/A"
+        majmin_str = f"{majmin:.4f}" if majmin is not None else "N/A"
+        overseg_str = f"{overseg:.4f}" if overseg is not None else "N/A"
+        underseg_str = f"{underseg:.4f}" if underseg is not None else "N/A"
+        seg_str = f"{seg:.4f}" if seg is not None else "N/A"
+        
+        print(f"{subdir:40s} | {mirex_str:>7s} | {root_str:>7s} | {majmin_str:>7s} | {overseg_str:>7s} | {underseg_str:>7s} | {seg_str:>7s}")
+    
+    # Save results to JSON file
+    os.makedirs("predictions", exist_ok=True)
+    json_output_path = "predictions/extended_dataset_results.json"
+    
+    # Convert numpy types to Python native types for JSON serialization
+    def convert_to_serializable(obj):
+        if isinstance(obj, (np.floating, np.integer)):
+            return float(obj) if isinstance(obj, np.floating) else int(obj)
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_serializable(item) for item in obj]
+        return obj
+    
+    serializable_results = convert_to_serializable(custom_results)
+    
+    with open(json_output_path, 'w') as f:
+        json.dump(serializable_results, f, indent=2)
+    
+    print(f"\nEvaluation results saved to {json_output_path}")
     
     # # 8. Evaluate single audio file (not in mirdata structure)
     # print("\n" + "=" * 60)
@@ -1280,7 +1344,7 @@ if __name__ == "__main__":
     # single_result = custom_eval.evaluate_audio_file(
     #     audio_path="dataset_eval/1058_Ain't_No_Sunshine/Ain't_No_Sunshine.wav",
     #     lab_path="dataset_eval/1058_Ain't_No_Sunshine/full.lab",
-    #     metrics=["mirex", "root", "majmin"],
+    #     metrics=["mirex", "root", "majmin", "majmin_inv", "sevenths", "sevenths_inv", "overseg", "underseg", "seg"],
     #     save_lab="predictions/my_song_predicted.lab",
     #     target_sr=44100
     # )
