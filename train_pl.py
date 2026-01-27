@@ -149,7 +149,10 @@ class ChordDataModule(pl.LightningDataModule):
 
         # Weight calculation and caching
         no_idx = self.base_dataset.label_to_idx[mrc.NO_CHORD]
-        cache_path = os.path.join(self.root, ".segment_weights.pkl")
+        if self.segment_seconds == 8.0:
+            cache_path = os.path.join(self.root, ".segment_weights.pkl")
+        elif self.segment_seconds == 20.0:
+            cache_path = os.path.join(self.root, ".segment_weights_20sec.pkl")
         
         if os.path.exists(cache_path):
             print(f"Loading cached segment weights from {cache_path}")
@@ -241,6 +244,8 @@ if __name__ == "__main__":
                         help="FFT size (only used if --frontend=mel)")
     parser.add_argument("--n_cqt_bins", type=int, default=84,
                         help="Number of CQT bins (only used if --frontend=cqt)")
+    parser.add_argument("--segment_seconds", type=float, default=8.0,
+                        help="Segment length in seconds for training")
     args = parser.parse_args()
 
     # Determine optimal workers
@@ -288,7 +293,7 @@ if __name__ == "__main__":
         d_model=256,
         nhead=8,
         num_layers=4,
-        segment_seconds=8.0,
+        segment_seconds=args.segment_seconds,
         ignore_index=no_idx,
         **frontend_kwargs,
     )
@@ -299,7 +304,7 @@ if __name__ == "__main__":
         base_dataset=ds,
         batch_size=args.batch_size,
         fps=100,
-        segment_seconds=8.0,
+        segment_seconds=args.segment_seconds,
         num_workers=workers
     )
 
