@@ -1,8 +1,11 @@
 import math
 import torch
 import librosa
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from abc import ABC, abstractmethod
+from enum import Enum
 
 # Try to use torchaudio if available (faster / GPU-capable). Fall back to librosa if needed.
 try:
@@ -10,11 +13,49 @@ try:
     TORCHAUDIO_AVAILABLE = True
 except Exception:
     TORCHAUDIO_AVAILABLE = False
-    import librosa
-    import numpy as np
 
 
-class MelFrontend(nn.Module):
+# ========================
+# Frontend Type Enum
+# ========================
+class FrontendType(Enum):
+    """Supported frontend types for spectral feature extraction."""
+    MEL = "mel"
+    CQT = "cqt"
+
+
+# ========================
+# Base Frontend Class
+# ========================
+class BaseFrontend(nn.Module, ABC):
+    """Abstract base class for all frontend feature extractors."""
+    
+    def __init__(self, sample_rate: int = 44100, fps: int = 100):
+        super().__init__()
+        self.sr = sample_rate
+        self.fps = fps
+        self.hop_length = int(round(sample_rate / fps))
+        self.n_frames = None
+    
+    @abstractmethod
+    def forward(self, audio):
+        """
+        Extract features from audio.
+        Args:
+            audio: (B, seg_samples) or (seg_samples,) torch tensor
+        Returns:
+            Feature tensor of shape (B, n_bins, T) or (n_bins, T)
+        """
+        pass
+    
+    @property
+    @abstractmethod
+    def n_bins(self):
+        """Number of frequency bins in the output."""
+        pass
+
+
+class MelFrontend(BaseFrontend):
     def __init__(
         self,
         sample_rate: int = 44100,
@@ -25,11 +66,8 @@ class MelFrontend(nn.Module):
         f_min: int = 0,
         f_max: int | None = None,
     ):
-        super().__init__()
-        self.sr = sample_rate
-        self.fps = fps
-        self.hop_length = int(round(sample_rate / fps))  # e.g., 441
-        self.n_mels = n_mels
+        super().__init__(sample_rate=sample_rate, fps=fps)
+        self._n_mels = n_mels
         self.n_fft = n_fft
         self.f_min = f_min
         self.f_max = f_max or sample_rate // 2
@@ -42,7 +80,7 @@ class MelFrontend(nn.Module):
                 hop_length=self.hop_length,
                 win_length=self.n_fft,
                 power=self.power,
-                n_mels=self.n_mels,
+                n_mels=self._n_mels,
                 f_min=self.f_min,
                 f_max=self.f_max,
                 norm='slaney',
@@ -52,6 +90,10 @@ class MelFrontend(nn.Module):
         else:
             # librosa-based fallback (performed in forward)
             self.melspec = None
+
+    @property
+    def n_bins(self):
+        return self._n_mels
 
     def forward(self, audio):  # audio: (B, seg_samples) or (seg_samples,) torch tensor
         """
@@ -93,7 +135,7 @@ class MelFrontend(nn.Module):
                     hop_length=self.hop_length,
                     win_length=self.n_fft,
                     power=self.power,
-                    n_mels=self.n_mels,
+                    n_mels=self._n_mels,
                     fmin=self.f_min,
                     fmax=self.f_max,
                 )
@@ -101,6 +143,115 @@ class MelFrontend(nn.Module):
                 mel_list.append(S_db)
             mel_np = np.stack(mel_list, axis=0)
             return torch.from_numpy(mel_np)
+
+
+class CQTFrontend(BaseFrontend):
+    def __init__(
+        self,
+        sample_rate: int = 44100,
+        fps: int = 100,
+        n_bins: int = 84,
+        bins_per_octave: int = 12,
+        f_min: float | None = None,
+        f_max: float | None = None,
+    ):
+        super().__init__(sample_rate=sample_rate, fps=fps)
+        self._n_bins = n_bins
+        self.bins_per_octave = bins_per_octave
+        self.f_min = f_min or 32.7  # ~C1
+        self.f_max = f_max or sample_rate / 2
+        
+        if TORCHAUDIO_AVAILABLE:
+            try:
+                self.cqt_transform = torchaudio.transforms.CQT(
+                    sample_rate=self.sr,
+                    n_fft=self.sr * 2,
+                    n_mels=n_bins,
+                    norm=True,
+                )
+                self.use_torchaudio_cqt = True
+            except Exception:
+                print("Warning: torchaudio CQT not available, using librosa")
+                self.use_torchaudio_cqt = False
+        else:
+            self.use_torchaudio_cqt = False
+
+    @property
+    def n_bins(self):
+        return self._n_bins
+
+    def forward(self, audio):
+        """
+        Returns: CQT magnitude tensor shaped (B, n_bins, T)
+        """
+        single_input = False
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+            single_input = True
+
+        # Use librosa CQT (more straightforward than torchaudio)
+        cqt_list = []
+        audio_np = audio.detach().cpu().numpy()
+        
+        for i in range(audio_np.shape[0]):
+            y = audio_np[i]
+            # Compute CQT
+            C = librosa.cqt(
+                y,
+                sr=self.sr,
+                hop_length=self.hop_length,
+                fmin=self.f_min,
+                n_bins=self._n_bins,
+                bins_per_octave=self.bins_per_octave,
+            )
+            # Convert to magnitude (absolute value) and to dB scale
+            S_db = librosa.amplitude_to_db(np.abs(C), ref=np.max).astype('float32')
+            cqt_list.append(S_db)
+        
+        cqt_np = np.stack(cqt_list, axis=0)
+        result = torch.from_numpy(cqt_np)
+        
+        # Align frame count with expected fps
+        total_samples = audio.shape[-1]
+        n_frames_expected = int(round(total_samples / self.hop_length))
+        self.n_frames = n_frames_expected
+        
+        if result.shape[-1] > n_frames_expected:
+            result = result[..., :n_frames_expected]
+        elif result.shape[-1] < n_frames_expected:
+            pad_amount = n_frames_expected - result.shape[-1]
+            result = F.pad(result, (0, pad_amount))
+        
+        return result if not single_input else result.squeeze(0)
+
+
+# ========================
+# Frontend Factory Function
+# ========================
+def create_frontend(frontend_type: FrontendType | str, **kwargs) -> BaseFrontend:
+    """
+    Factory function to create frontend feature extractors.
+    
+    Args:
+        frontend_type: Type of frontend (FrontendType enum or string)
+        **kwargs: Parameters to pass to the frontend constructor
+    
+    Returns:
+        BaseFrontend: Instance of the requested frontend
+    
+    Example:
+        frontend = create_frontend(FrontendType.MEL, n_mels=128, n_fft=2048)
+        frontend = create_frontend("cqt", n_bins=84)
+    """
+    if isinstance(frontend_type, str):
+        frontend_type = FrontendType(frontend_type.lower())
+    
+    if frontend_type == FrontendType.MEL:
+        return MelFrontend(**kwargs)
+    elif frontend_type == FrontendType.CQT:
+        return CQTFrontend(**kwargs)
+    else:
+        raise ValueError(f"Unknown frontend type: {frontend_type}")
 
 # ------------------------
 # 2) CNN encoder
@@ -111,9 +262,9 @@ class CNNEncoder(nn.Module):
     Input: (B, 1, F, T)
     Output: (B, T, d_model)
     """
-    def __init__(self, n_mels=128, d_model=256, chans=[64, 128, 256]):
+    def __init__(self, n_freq_bins=128, d_model=256, chans=[64, 128, 256]):
         super().__init__()
-        self.n_mels = n_mels
+        self.n_freq_bins = n_freq_bins
         self.d_model = d_model
 
         # Conv blocks with frequency pooling only (keep time dimension)
@@ -136,8 +287,8 @@ class CNNEncoder(nn.Module):
             # no pooling in time or freq here
         )
 
-        # After two freq pooling: freq_dim ~ n_mels // 4
-        self.freq_reduction = max(1, n_mels // 4)
+        # After two freq pooling: freq_dim ~ n_freq_bins // 4
+        self.freq_reduction = max(1, n_freq_bins // 4)
         # projection to desired d_model across frequency dim
         self.proj = nn.Conv2d(chans[2], d_model, kernel_size=(self.freq_reduction, 1))
 
@@ -193,22 +344,51 @@ class CNNTransformerChordModel(nn.Module):
         n_classes: int,
         sample_rate: int = 44100,
         fps: int = 100,
-        n_mels: int = 128,
-        n_fft: int = 2048,
+        frontend_type: FrontendType | str = "mel",
         d_model: int = 256,
         nhead: int = 8,
         num_layers: int = 4,
         freq_channels=[64,128,256],
         dropout: float = 0.1,
+        # Frontend-specific kwargs
+        n_mels: int | None = None,
+        n_fft: int | None = None,
+        n_cqt_bins: int | None = None,
+        **frontend_kwargs,
     ):
         super().__init__()
-        self.frontend = MelFrontend(sample_rate=sample_rate, fps=fps, n_mels=n_mels, n_fft=n_fft)
-        self.cnn = CNNEncoder(n_mels=n_mels, d_model=d_model, chans=freq_channels)
+        
+        # Create frontend based on type
+        if isinstance(frontend_type, str):
+            frontend_type = FrontendType(frontend_type.lower())
+        
+        if frontend_type == FrontendType.MEL:
+            mel_params = {
+                "sample_rate": sample_rate,
+                "fps": fps,
+                "n_mels": n_mels or 128,
+                "n_fft": n_fft or 2048,
+            }
+            mel_params.update(frontend_kwargs)
+            self.frontend = MelFrontend(**mel_params)
+        elif frontend_type == FrontendType.CQT:
+            cqt_params = {
+                "sample_rate": sample_rate,
+                "fps": fps,
+                "n_bins": n_cqt_bins or 84,
+            }
+            cqt_params.update(frontend_kwargs)
+            self.frontend = CQTFrontend(**cqt_params)
+        else:
+            raise ValueError(f"Unknown frontend type: {frontend_type}")
+        
+        self.cnn = CNNEncoder(n_freq_bins=self.frontend.n_bins, d_model=d_model, chans=freq_channels)
         self.transformer = TransformerEncoderModule(d_model=d_model, nhead=nhead, num_layers=num_layers,
                                                     dim_feedforward=d_model*4, dropout=dropout)
         self.classifier = nn.Linear(d_model, n_classes)
         self._n_classes = n_classes
         self._fps = fps
+        self.frontend_type = frontend_type
 
     def forward(self, audio): 
         """
@@ -219,14 +399,14 @@ class CNNTransformerChordModel(nn.Module):
             audio = audio.unsqueeze(0)
             single = True
 
-        # Mel frontend: returns (B, n_mels, T)
-        mel = self.frontend(audio)  # (B, n_mels, T)
-        mel = mel.to(audio.dtype).to(audio.device)
+        # Frontend: returns (B, n_bins, T)
+        features = self.frontend(audio)
+        features = features.to(audio.dtype).to(audio.device)
         # ensure shape for CNN: (B, 1, F, T)
-        mel = mel.unsqueeze(1)
+        features = features.unsqueeze(1)
 
         # CNN -> (B, T, d_model)
-        x = self.cnn(mel)
+        x = self.cnn(features)
 
         # Transformer -> (B, T, d_model)
         x = self.transformer(x)
@@ -245,17 +425,45 @@ class MultiHeadChordModel(nn.Module):
         n_bass: int,
         sample_rate: int = 44100,
         fps: int = 100,
-        n_mels: int = 128,
-        n_fft: int = 2048,
+        frontend_type: FrontendType | str = "mel",
         d_model: int = 256,
         nhead: int = 8,
         num_layers: int = 4,
         freq_channels=[64,128,256],
         dropout: float = 0.1,
+        # Frontend-specific kwargs
+        n_mels: int | None = None,
+        n_fft: int | None = None,
+        n_cqt_bins: int | None = None,
+        **frontend_kwargs,
     ):
         super().__init__()
-        self.frontend = MelFrontend(sample_rate=sample_rate, fps=fps, n_mels=n_mels, n_fft=n_fft)
-        self.cnn = CNNEncoder(n_mels=n_mels, d_model=d_model, chans=freq_channels)
+        
+        # Create frontend based on type
+        if isinstance(frontend_type, str):
+            frontend_type = FrontendType(frontend_type.lower())
+        
+        if frontend_type == FrontendType.MEL:
+            mel_params = {
+                "sample_rate": sample_rate,
+                "fps": fps,
+                "n_mels": n_mels or 128,
+                "n_fft": n_fft or 2048,
+            }
+            mel_params.update(frontend_kwargs)
+            self.frontend = MelFrontend(**mel_params)
+        elif frontend_type == FrontendType.CQT:
+            cqt_params = {
+                "sample_rate": sample_rate,
+                "fps": fps,
+                "n_bins": n_cqt_bins or 84,
+            }
+            cqt_params.update(frontend_kwargs)
+            self.frontend = CQTFrontend(**cqt_params)
+        else:
+            raise ValueError(f"Unknown frontend type: {frontend_type}")
+        
+        self.cnn = CNNEncoder(n_freq_bins=self.frontend.n_bins, d_model=d_model, chans=freq_channels)
         self.transformer = TransformerEncoderModule(d_model=d_model, nhead=nhead, num_layers=num_layers,
                                                     dim_feedforward=d_model*4, dropout=dropout)
         self.classifiers = nn.ModuleList([
@@ -267,6 +475,7 @@ class MultiHeadChordModel(nn.Module):
         self._n_qualities = n_qualities
         self._n_bass = n_bass
         self._fps = fps
+        self.frontend_type = frontend_type
 
     def forward(self, audio):
         """

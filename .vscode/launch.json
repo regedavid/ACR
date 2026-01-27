@@ -32,7 +32,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/train_pl.py",
             "console": "integratedTerminal",
-            "args": ["--external_root", "${workspaceFolder}/dataset_eval"]
+            "args": ["--external_root", "${workspaceFolder}/dataset_ext"]
         },
         {
             "name": "Evaluate",

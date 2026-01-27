@@ -12,7 +12,7 @@ import argparse
 # ---------------------------
 # Import your model and dataset
 # ---------------------------
-from cnn_acr import CNNTransformerChordModel
+from cnn_acr import CNNTransformerChordModel, FrontendType
 from dataset import BeatlesChordDataset, BeatlesMajMinChordDataset, SegmentWrapper
 from custom_dataset import build_combined_dataset
 
@@ -176,6 +176,7 @@ class ChordDataModule(pl.LightningDataModule):
                 # Give a small minimum weight to avoid dropping segments entirely
                 # (e.g., all-N segments still get sampled, just very rarely)
                 sample_weights.append(max(weight, 0.01))
+                print(f"Processed segment {len(sample_weights)}/{total}", end="\r")
 
             try:
                 with open(cache_path, "wb") as f:
@@ -219,6 +220,9 @@ class ChordDataModule(pl.LightningDataModule):
 # 3) Train Script (Local Version)
 # ===========================================================
 if __name__ == "__main__":
+    seed = 1234
+    pl.seed_everything(seed, workers=True)
+    
     # Handle Command Line Arguments
     parser = argparse.ArgumentParser(description="Train Chord Model Locally")
     parser.add_argument("--data_dir", type=str, default="./mir_datasets2/beatles", 
@@ -229,6 +233,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--experiment_name", type=str, default="chord_model", 
                         help="Name of the experiment for organizing logs and checkpoints")
+    parser.add_argument("--frontend", type=str, default="mel", choices=["mel", "cqt"],
+                        help="Frontend type: 'mel' for Mel spectrogram or 'cqt' for Constant-Q Transform")
+    parser.add_argument("--n_mels", type=int, default=128, 
+                        help="Number of Mel bands (only used if --frontend=mel)")
+    parser.add_argument("--n_fft", type=int, default=2048,
+                        help="FFT size (only used if --frontend=mel)")
+    parser.add_argument("--n_cqt_bins", type=int, default=84,
+                        help="Number of CQT bins (only used if --frontend=cqt)")
     args = parser.parse_args()
 
     # Determine optimal workers
@@ -259,16 +271,26 @@ if __name__ == "__main__":
     n_classes = len(ds.label_to_idx)
     no_idx = ds.label_to_idx[mrc.NO_CHORD]
     print(f"Number of chord classes: {n_classes}")
+    print(f"Using {args.frontend.upper()} frontend")
+
+    # Build frontend-specific kwargs
+    frontend_kwargs = {}
+    if args.frontend == "mel":
+        frontend_kwargs = {"n_mels": args.n_mels, "n_fft": args.n_fft}
+    elif args.frontend == "cqt":
+        frontend_kwargs = {"n_cqt_bins": args.n_cqt_bins}
 
     # 2. Initialize Model
     model = LightningChordModel(
         n_classes=n_classes,
         lr=3e-4,
+        frontend_type=args.frontend,
         d_model=256,
         nhead=8,
         num_layers=4,
         segment_seconds=8.0,
         ignore_index=no_idx,
+        **frontend_kwargs,
     )
 
     # 3. Initialize DataModule
