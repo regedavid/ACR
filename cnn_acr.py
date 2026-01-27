@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from enum import Enum
 
+
 # Try to use torchaudio if available (faster / GPU-capable). Fall back to librosa if needed.
 try:
     import torchaudio
@@ -21,10 +22,8 @@ try:
 except Exception:
     NNAUDIO_AVAILABLE = False
 
-
-# ========================
-# Frontend Type Enum
-# ========================
+    
+    
 class FrontendType(Enum):
     """Supported frontend types for spectral feature extraction."""
     MEL = "mel"
@@ -460,68 +459,51 @@ class MultiHeadChordModel(nn.Module):
     ):
         super().__init__()
         
-        # Create frontend based on type
+        # 1. Setup Frontend (Same as single model)
         if isinstance(frontend_type, str):
             frontend_type = FrontendType(frontend_type.lower())
         
         if frontend_type == FrontendType.MEL:
-            mel_params = {
-                "sample_rate": sample_rate,
-                "fps": fps,
-                "n_mels": n_mels or 128,
-                "n_fft": n_fft or 2048,
-            }
+            mel_params = {"sample_rate": sample_rate, "fps": fps, "n_mels": n_mels or 128, "n_fft": n_fft or 2048}
             mel_params.update(frontend_kwargs)
             self.frontend = MelFrontend(**mel_params)
         elif frontend_type == FrontendType.CQT:
-            cqt_params = {
-                "sample_rate": sample_rate,
-                "fps": fps,
-                "n_bins": n_cqt_bins or 84,
-            }
+            cqt_params = {"sample_rate": sample_rate, "fps": fps, "n_bins": n_cqt_bins or 84}
             cqt_params.update(frontend_kwargs)
             self.frontend = CQTFrontend(**cqt_params)
         else:
             raise ValueError(f"Unknown frontend type: {frontend_type}")
         
+        # 2. Shared Encoder
         self.cnn = CNNEncoder(n_freq_bins=self.frontend.n_bins, d_model=d_model, chans=freq_channels)
         self.transformer = TransformerEncoderModule(d_model=d_model, nhead=nhead, num_layers=num_layers,
                                                     dim_feedforward=d_model*4, dropout=dropout)
-        self.classifiers = nn.ModuleList([
-            nn.Linear(d_model, n_roots),
-            nn.Linear(d_model, n_qualities),
-            nn.Linear(d_model, n_bass),
-        ])
-        self._n_roots = n_roots
-        self._n_qualities = n_qualities
-        self._n_bass = n_bass
-        self._fps = fps
-        self.frontend_type = frontend_type
+        
+        # 3. Multi-Heads
+        self.root_head = nn.Linear(d_model, n_roots)
+        self.quality_head = nn.Linear(d_model, n_qualities)
+        self.bass_head = nn.Linear(d_model, n_bass)
 
     def forward(self, audio):
-        """
-        audio: Tensor (B, seg_samples) or (seg_samples,) -> returns list of logits [(B, T, n_classes_i), ...]
-        """
         single = False
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
             single = True
 
-        # Shared forward
-        mel = self.shared_model.frontend(audio)  # (B, n_mels, T)
-        mel = mel.to(audio.dtype).to(audio.device)
-        mel = mel.unsqueeze(1)
-        x = self.shared_model.cnn(mel)
-        x = self.shared_model.transformer(x)
+        # Shared path
+        features = self.frontend(audio)
+        features = features.to(audio.dtype).to(audio.device).unsqueeze(1) # (B, 1, F, T)
+        x = self.cnn(features) # (B, T, D)
+        x = self.transformer(x) # (B, T, D)
 
-        # Multiple classifiers
-        roots_logits = self.classifiers[0](x)
-        qualities_logits = self.classifiers[1](x)
-        bass_logits = self.classifiers[2](x)
+        # Split paths
+        root_logits = self.root_head(x)
+        quality_logits = self.quality_head(x)
+        bass_logits = self.bass_head(x)
 
-        return roots_logits.squeeze(0) if single else roots_logits, \
-               qualities_logits.squeeze(0) if single else qualities_logits, \
-               bass_logits.squeeze(0) if single else bass_logits
+        if single:
+            return root_logits.squeeze(0), quality_logits.squeeze(0), bass_logits.squeeze(0)
+        return root_logits, quality_logits, bass_logits
 
 
 class HMMDecoder:

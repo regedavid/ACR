@@ -8,6 +8,26 @@ import librosa
 from util import map_to_majmin
 
 
+def decompose_label(label):
+    """Splits 'C:min7/G' into 'C', 'min7', 'G'."""
+    if label == mrc.NO_CHORD:
+        return "N", "N", "N"
+    try:
+        root, quality, intervals, bass = mrc.split(label)
+        
+        # 2. Handle Empty Quality
+        # If mir_eval returns empty string, map it to 'N' (or 'open', 'none')
+        qual_str = quality if quality != "" else "N"
+        
+        # 3. Handle Empty Bass (mir_eval usually defaults to '1', but just in case)
+        bass_str = bass if bass != "" else "1"
+        
+        return root, qual_str, bass_str
+        
+    except Exception:
+        # Fallback for parsing errors
+        return "N", "N", "N"
+
 def compute_cqt(y, sr, hop_length, n_bins=84, bins_per_octave=12):
     """
     Compute log magnitude CQT and return shape (freq_bins, time_frames).
@@ -21,7 +41,8 @@ def compute_cqt(y, sr, hop_length, n_bins=84, bins_per_octave=12):
 
 
 class BeatlesChordDataset(Dataset):
-    def __init__(self, root, fps=100):
+    def __init__(self, root, fps=100, multi_target=False):
+        self.multi_target = multi_target
         self.dataset = mirdata.initialize("beatles", data_home=root)
         self.fps = fps
 
@@ -82,18 +103,35 @@ class BeatlesChordDataset(Dataset):
         all_labels.add(mrc.NO_CHORD)
         all_labels = sorted(all_labels)
 
-        # numeric encodings
-        # roots, bitmaps, basses = mrc.encode_many(all_labels)
-        # encodings = []
-        # for r, b, ba in zip(roots, bitmaps, basses):
-        #     encodings.append((int(r), tuple(b.tolist()), int(ba)))
-
-        # self.encoding_to_idx = {enc: i for i, enc in enumerate(encodings)}
-        # self.label_to_encoding = dict(zip(all_labels, encodings))
-        
-        self.label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
-        self.idx_to_label = {i: lab for lab, i in self.label_to_idx.items()}
-        self.n_classes = len(all_labels)
+        if self.multi_target:
+            # Build 3 separate Vocabs
+            roots, qualities, basses = set(), set(), set()
+            for lab in all_labels:
+                r, q, b = decompose_label(lab)
+                roots.add(r)
+                qualities.add(q)
+                basses.add(b)
+            
+            roots.add("N")
+            qualities.add("N")
+            basses.add("N")
+            
+            self.root2idx = {r: i for i, r in enumerate(sorted(roots))}
+            self.qual2idx = {q: i for i, q in enumerate(sorted(qualities))}
+            self.bass2idx = {b: i for i, b in enumerate(sorted(basses))}
+            
+            self.idx2root = {i: r for r, i in self.root2idx.items()}
+            self.idx2qual = {i: q for q, i in self.qual2idx.items()}
+            self.idx2bass = {i: b for b, i in self.bass2idx.items()}
+            
+            self.n_roots = len(self.root2idx)
+            self.n_qualities = len(self.qual2idx)
+            self.n_bass = len(self.bass2idx)
+            print(f"Multi-Target Vocabs: {self.n_roots} Roots, {self.n_qualities} Qualities, {self.n_bass} Basses")
+        else:
+            self.label_to_idx = {lab: i for i, lab in enumerate(all_labels)}
+            self.idx_to_label = {i: lab for lab, i in self.label_to_idx.items()}
+            self.n_classes = len(all_labels)
 
         print(f"Chord vocabulary size: {self.n_classes} classes.")
 
@@ -126,16 +164,33 @@ class BeatlesChordDataset(Dataset):
 
         frame_labels = np.full(n_frames, no_idx, dtype=np.int64)
 
-        # Fill interval labels
-        for (start, end), lab in zip(intervals, labels):
-            idx_c = self.label_to_idx.get(lab, no_idx)
-            mask = (frame_times >= start) & (frame_times < end)
-            frame_labels[mask] = idx_c
+        if self.multi_target:
+            # Create 3 tensor arrays
+            root_labels = np.zeros(n_frames, dtype=np.int64)
+            qual_labels = np.zeros(n_frames, dtype=np.int64)
+            bass_labels = np.zeros(n_frames, dtype=np.int64)
+            
+            # Fill them
+            for (start, end), lab in zip(intervals, labels):
+                r_str, q_str, b_str = decompose_label(lab)
+                mask = (frame_times >= start) & (frame_times < end)
+                
+                root_labels[mask] = self.root2idx.get(r_str, 0)
+                qual_labels[mask] = self.qual2idx.get(q_str, 0)
+                bass_labels[mask] = self.bass2idx.get(b_str, 0)
 
-        return (
-            torch.from_numpy(y),
-            torch.from_numpy(frame_labels),
-        )
+            return torch.from_numpy(y), (torch.from_numpy(root_labels), torch.from_numpy(qual_labels), torch.from_numpy(bass_labels))
+        else:
+            # Fill interval labels
+            for (start, end), lab in zip(intervals, labels):
+                idx_c = self.label_to_idx.get(lab, no_idx)
+                mask = (frame_times >= start) & (frame_times < end)
+                frame_labels[mask] = idx_c
+
+            return (
+                torch.from_numpy(y),
+                torch.from_numpy(frame_labels),
+            )
 
 
 class BeatlesMajMinChordDataset(Dataset):
@@ -305,9 +360,23 @@ class SegmentWrapper(torch.utils.data.Dataset):
             pad = self.seg_samples - len(audio_seg)
             audio_seg = torch.nn.functional.pad(audio_seg, (0, pad), mode="constant", value=0.0)
 
-        label_seg = labels[start_frame:end_frame]
-        if len(label_seg) < self.seg_frames:
-            pad = self.seg_frames - len(label_seg)
-            label_seg = torch.nn.functional.pad(label_seg, (0, pad), mode="constant", value=self.base.label_to_idx[mrc.NO_CHORD])
+        if isinstance(labels, tuple): # Multi-target case
+            root_seg, qual_seg, bass_seg = labels
+            
+            # Helper to slice and pad
+            def slice_pad(tensor_data):
+                seg = tensor_data[start_frame:end_frame]
+                if len(seg) < self.seg_frames:
+                    pad = self.seg_frames - len(seg)
+                    # Use 0 (usually No Chord) for padding
+                    seg = torch.nn.functional.pad(seg, (0, pad), mode="constant", value=0)
+                return seg
+            
+            return audio_seg, (slice_pad(root_seg), slice_pad(qual_seg), slice_pad(bass_seg))
+        else:
+            label_seg = labels[start_frame:end_frame]
+            if len(label_seg) < self.seg_frames:
+                pad = self.seg_frames - len(label_seg)
+                label_seg = torch.nn.functional.pad(label_seg, (0, pad), mode="constant", value=self.base.label_to_idx[mrc.NO_CHORD])
 
-        return audio_seg, label_seg
+            return audio_seg, label_seg

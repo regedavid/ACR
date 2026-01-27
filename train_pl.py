@@ -28,18 +28,26 @@ class LightningChordModel(pl.LightningModule):
         fps=100,
         segment_seconds=8.0,
         ignore_index=-100,
+        multi_target=False,
+        n_roots=None, n_qualities=None, n_basses=None,
         **model_kwargs,
     ):
         super().__init__()
         self.save_hyperparameters()
+        self.multi_target = multi_target
 
         # Build underlying model
-        self.model = CNNTransformerChordModel(
-            n_classes=n_classes,
-            sample_rate=sample_rate,
-            fps=fps,
-            **model_kwargs
-        )
+        if self.multi_target:
+            from cnn_acr import MultiHeadChordModel
+            self.model = MultiHeadChordModel(
+                n_roots=n_roots, n_qualities=n_qualities, n_bass=n_basses,
+                **model_kwargs
+            )
+        else:
+            self.model = CNNTransformerChordModel(
+                n_classes=n_classes,
+                **model_kwargs
+            )
 
         self.lr = lr
 
@@ -47,51 +55,93 @@ class LightningChordModel(pl.LightningModule):
         return self.model(audio_batch)
 
     def training_step(self, batch, batch_idx):
-        audio, labels = batch
-        audio = audio.to(self.device)
-        labels = labels.to(self.device).long()
-        logits = self(audio)              # (B, T, n_classes)
-        B, T, C = logits.shape
+        if self.multi_target:
+            audio, (r_true, q_true, b_true) = batch
+            audio = audio.to(self.device)
+            r_true, q_true, b_true = r_true.long(), q_true.long(), b_true.long()
+            
+            # Forward
+            r_logits, q_logits, b_logits = self.model(audio) # (B, T, C)
+            
+            # Flatten
+            def flatten_loss(logits, targets):
+                return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
 
-        ignore_idx = getattr(self.hparams, "ignore_index", -100)
+            loss = flatten_loss(r_logits, r_true) + \
+                   flatten_loss(q_logits, q_true) + \
+                   0.5 * flatten_loss(b_logits, b_true) # Weight bass less?
+            
+            self.log("train_loss", loss, on_step=True, prog_bar=True)
+            return loss
+        else:
+            audio, labels = batch
+            audio = audio.to(self.device)
+            labels = labels.to(self.device).long()
+            logits = self(audio)              # (B, T, n_classes)
+            B, T, C = logits.shape
 
-        loss = F.cross_entropy(
-            logits.reshape(B * T, C),
-            labels.reshape(B * T),
-            ignore_index=ignore_idx,
-        )
-        
-        # Log training loss
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+            ignore_idx = getattr(self.hparams, "ignore_index", -100)
+
+            loss = F.cross_entropy(
+                logits.reshape(B * T, C),
+                labels.reshape(B * T),
+                ignore_index=ignore_idx,
+            )
+            
+            # Log training loss
+            self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+            return loss
 
     def validation_step(self, batch, batch_idx):
-        audio, labels = batch
-        audio = audio.to(self.device)
-        labels = labels.to(self.device).long()
-        logits = self(audio)
-        B, T, C = logits.shape
+        if self.multi_target:
+            # --- MULTI-TARGET VALIDATION ---
+            audio, (r_true, q_true, b_true) = batch
+            r_logits, q_logits, b_logits = self(audio)
 
-        ignore_idx = getattr(self.hparams, "ignore_index", -100)
+            # 1. Compute Losses
+            loss_r = F.cross_entropy(r_logits.transpose(1, 2), r_true, ignore_index=self.hparams.ignore_root)
+            loss_q = F.cross_entropy(q_logits.transpose(1, 2), q_true, ignore_index=self.hparams.ignore_qual)
+            loss_b = F.cross_entropy(b_logits.transpose(1, 2), b_true, ignore_index=self.hparams.ignore_bass)
+            total_loss = loss_r + loss_q + 0.5 * loss_b
 
-        loss = F.cross_entropy(
-            logits.reshape(B * T, C),
-            labels.reshape(B * T),
-            ignore_index=ignore_idx,
-        )
+            # 2. Compute Accuracies
+            def get_acc(logits, target, ignore_idx):
+                preds = logits.argmax(dim=-1)
+                mask = target != ignore_idx
+                if mask.sum() > 0:
+                    return (preds[mask] == target[mask]).float().mean()
+                return torch.tensor(0.0, device=self.device)
 
-        # Accuracy: framewise argmax
-        preds = logits.argmax(dim=-1)
-        mask = labels != ignore_idx
-        
-        if mask.any():
-            acc = (preds[mask] == labels[mask]).float().mean()
+            acc_r = get_acc(r_logits, r_true, self.hparams.ignore_root)
+            acc_q = get_acc(q_logits, q_true, self.hparams.ignore_qual)
+            acc_b = get_acc(b_logits, b_true, self.hparams.ignore_bass)
+
+            # 3. Log Everything
+            self.log("val_loss", total_loss, on_epoch=True, prog_bar=True)
+            self.log("val_acc_root", acc_r, on_epoch=True)
+            self.log("val_acc_qual", acc_q, on_epoch=True)
+            self.log("val_acc_bass", acc_b, on_epoch=True)
+
         else:
-            acc = torch.tensor(0.0, device=self.device)
+            # --- SINGLE-TARGET VALIDATION ---
+            audio, labels = batch
+            logits = self(audio)
+            
+            loss = F.cross_entropy(
+                logits.transpose(1, 2), 
+                labels, 
+                ignore_index=self.hparams.ignore_index
+            )
+            
+            preds = logits.argmax(dim=-1)
+            mask = labels != self.hparams.ignore_index
+            if mask.sum() > 0:
+                acc = (preds[mask] == labels[mask]).float().mean()
+            else:
+                acc = torch.tensor(0.0, device=self.device)
 
-        self.log("val_loss", loss, on_epoch=True, prog_bar=False)
-        self.log("val_acc", acc, on_epoch=True, prog_bar=False)
-        return {"val_loss": loss, "val_acc": acc}
+            self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+            self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
@@ -246,6 +296,8 @@ if __name__ == "__main__":
                         help="Number of CQT bins (only used if --frontend=cqt)")
     parser.add_argument("--segment_seconds", type=float, default=8.0,
                         help="Segment length in seconds for training")
+    parser.add_argument("--multi_layer", action="store_true", default=False,
+                        help="Enable multi-task learning (Root, Quality, Bass)")
     args = parser.parse_args()
 
     # Determine optimal workers
@@ -262,16 +314,26 @@ if __name__ == "__main__":
     # Use combined dataset if external_root is provided, otherwise just Beatles
     if args.external_root:
         print(f"Using combined dataset: Beatles + External ({args.external_root})")
-        ds, label_to_idx, idx_to_label = build_combined_dataset(
-            beatles_root=args.data_dir,
-            external_root=args.external_root,
-            fps=100,
-            sample_rate=None  # Will use Beatles sample rate
-        )
-        print(f"Combined dataset: {len(ds)} total tracks")
+        if args.multi_layer:
+            ds, r2i, q2i, b2i = build_combined_dataset(
+                beatles_root=args.data_dir,
+                external_root=args.external_root,
+                fps=100,
+                multi_target=True
+            )
+            print(f"Vocab: {len(r2i)} Roots, {len(q2i)} Qualities, {len(b2i)} Basses")
+        else:
+            # Single target returns (ds, l2i, i2l, None)
+            ds, l2i, i2l, _ = build_combined_dataset(
+                beatles_root=args.data_dir,
+                external_root=args.external_root,
+                fps=100,
+                multi_target=False
+            )
+            print(f"Vocab: {len(l2i)} Chord Classes")
     else:
         print("Using Beatles dataset only")
-        ds = BeatlesChordDataset(args.data_dir, fps=100)
+        ds = BeatlesChordDataset(args.data_dir, fps=100, multi_target=args.multi_layer)
     
     n_classes = len(ds.label_to_idx)
     no_idx = ds.label_to_idx[mrc.NO_CHORD]
@@ -285,18 +347,40 @@ if __name__ == "__main__":
     elif args.frontend == "cqt":
         frontend_kwargs = {"n_cqt_bins": args.n_cqt_bins}
 
-    # 2. Initialize Model
-    model = LightningChordModel(
-        n_classes=n_classes,
-        lr=3e-4,
-        frontend_type=args.frontend,
-        d_model=256,
-        nhead=8,
-        num_layers=4,
-        segment_seconds=args.segment_seconds,
-        ignore_index=no_idx,
-        **frontend_kwargs,
-    )
+    if args.multi_layer:
+        # Multi-Target Initialization
+        model = LightningChordModel(
+            multi_target=True,
+            n_roots=ds.n_roots,
+            n_qualities=ds.n_qualities,
+            n_basses=ds.n_bass,
+            # Common args
+            lr=3e-4,
+            frontend_type=args.frontend,
+            d_model=256,
+            nhead=8,
+            num_layers=4,
+            segment_seconds=args.segment_seconds,
+            **frontend_kwargs,
+        )
+        monitor_metric = "val_loss" # Accuracy is complex in multi-head, verify loss instead
+    else:
+        # Single-Target Initialization
+        no_idx = ds.label_to_idx[mrc.NO_CHORD]
+        model = LightningChordModel(
+            multi_target=False,
+            n_classes=ds.n_classes,
+            ignore_index=no_idx,
+            # Common args
+            lr=3e-4,
+            frontend_type=args.frontend,
+            d_model=256,
+            nhead=8,
+            num_layers=4,
+            segment_seconds=args.segment_seconds,
+            **frontend_kwargs,
+        )
+        monitor_metric = "val_acc"
 
     # 3. Initialize DataModule
     dm = ChordDataModule(
@@ -310,10 +394,10 @@ if __name__ == "__main__":
 
     # 4. Checkpoint Callback
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_acc",
-        mode="max",
+        monitor=monitor_metric,
+        mode="min" if monitor_metric == "val_loss" else "max",
         dirpath=f"checkpoints/{args.experiment_name}/",
-        filename="{epoch:02d}-{val_acc:.2f}",
+        filename="{epoch:02d}-{" + monitor_metric + ":.2f}",
         save_top_k=1,
         verbose=True,
     )
