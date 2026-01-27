@@ -14,6 +14,13 @@ try:
 except Exception:
     TORCHAUDIO_AVAILABLE = False
 
+# Try to use nnAudio if available (GPU-accelerated CQT computation)
+try:
+    from nnAudio import features as nnAudio_features
+    NNAUDIO_AVAILABLE = True
+except Exception:
+    NNAUDIO_AVAILABLE = False
+
 
 # ========================
 # Frontend Type Enum
@@ -161,20 +168,22 @@ class CQTFrontend(BaseFrontend):
         self.f_min = f_min or 32.7  # ~C1
         self.f_max = f_max or sample_rate / 2
         
-        if TORCHAUDIO_AVAILABLE:
+        if NNAUDIO_AVAILABLE:
             try:
-                self.cqt_transform = torchaudio.transforms.CQT(
-                    sample_rate=self.sr,
-                    n_fft=self.sr * 2,
-                    n_mels=n_bins,
-                    norm=True,
+                self.cqt_transform = nnAudio_features.CQT(
+                    sr=self.sr,
+                    hop_length=self.hop_length,
+                    fmin=self.f_min,
+                    n_bins=n_bins,
+                    bins_per_octave=bins_per_octave,
+                    verbose=False,
                 )
-                self.use_torchaudio_cqt = True
-            except Exception:
-                print("Warning: torchaudio CQT not available, using librosa")
-                self.use_torchaudio_cqt = False
+                self.use_nnaudio = True
+            except Exception as e:
+                print(f"Warning: nnAudio CQT initialization failed ({e}), using librosa")
+                self.use_nnaudio = False
         else:
-            self.use_torchaudio_cqt = False
+            self.use_nnaudio = False
 
     @property
     def n_bins(self):
@@ -189,27 +198,39 @@ class CQTFrontend(BaseFrontend):
             audio = audio.unsqueeze(0)
             single_input = True
 
-        # Use librosa CQT (more straightforward than torchaudio)
-        cqt_list = []
-        audio_np = audio.detach().cpu().numpy()
-        
-        for i in range(audio_np.shape[0]):
-            y = audio_np[i]
-            # Compute CQT
-            C = librosa.cqt(
-                y,
-                sr=self.sr,
-                hop_length=self.hop_length,
-                fmin=self.f_min,
-                n_bins=self._n_bins,
-                bins_per_octave=self.bins_per_octave,
-            )
-            # Convert to magnitude (absolute value) and to dB scale
-            S_db = librosa.amplitude_to_db(np.abs(C), ref=np.max).astype('float32')
-            cqt_list.append(S_db)
-        
-        cqt_np = np.stack(cqt_list, axis=0)
-        result = torch.from_numpy(cqt_np)
+        if self.use_nnaudio:
+            # Use nnAudio CQT (GPU-accelerated)
+            with torch.no_grad():
+                # nnAudio expects (B, samples) and returns (B, n_bins, T)
+                cqt = self.cqt_transform(audio)  # Returns complex tensor
+                # Get magnitude and convert to dB
+                magnitude = torch.abs(cqt)
+                # Convert to dB scale (log10)
+                result = 20 * torch.log10(magnitude + 1e-8)
+                # Normalize similar to librosa's ref=np.max
+                result = result - result.max()
+        else:
+            # Fallback: Use librosa CQT (CPU-based)
+            cqt_list = []
+            audio_np = audio.detach().cpu().numpy()
+            
+            for i in range(audio_np.shape[0]):
+                y = audio_np[i]
+                # Compute CQT
+                C = librosa.cqt(
+                    y,
+                    sr=self.sr,
+                    hop_length=self.hop_length,
+                    fmin=self.f_min,
+                    n_bins=self._n_bins,
+                    bins_per_octave=self.bins_per_octave,
+                )
+                # Convert to magnitude (absolute value) and to dB scale
+                S_db = librosa.amplitude_to_db(np.abs(C), ref=np.max).astype('float32')
+                cqt_list.append(S_db)
+            
+            cqt_np = np.stack(cqt_list, axis=0)
+            result = torch.from_numpy(cqt_np).to(audio.device)
         
         # Align frame count with expected fps
         total_samples = audio.shape[-1]
